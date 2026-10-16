@@ -1,0 +1,2484 @@
+-- LotScript UI (v6: quét map 2 chế độ fix "no map" + tên hook di chuyển riêng)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local PathfindingService = game:GetService("PathfindingService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- [FIX] tên hook di chuyển riêng cho mỗi lần chạy (bản cũ không gỡ nhầm được)
+local MOVE_NAME = "LotScriptMove" .. tostring(math.random(100000, 999999))
+
+----------------------------------------------------------------
+-- CẤU HÌNH (sửa ở đây)
+----------------------------------------------------------------
+local CONFIG = {
+	AssistKey = Enum.KeyCode.Z,
+
+ReplayRemote  = { name = "ArenaAction", keywords = { "replay", "retry" }, args = { "VoteReplay" } },
+	NextActRemote = { name = "ArenaAction", keywords = { "nextact", "next_act", "next" }, args = { "VoteNextAct" } },
+
+VoteArgCandidates = {
+		replay = { { "VoteReplay" }, { "Replay" }, { "Vote", "Replay" }, { "VoteRetry" }, { "Retry" } },
+		next   = { { "VoteNextAct" }, { "VoteNext" }, { "NextAct" }, { "Vote", "NextAct" },
+		           { "VoteNextStage" }, { "VoteNextLevel" }, { "VoteContinue" }, { "VoteNextWave" } },
+	},
+
+RequireResultScreen = true,
+
+-- ===== Chọn mục tiêu =====
+	BossName = "Statue of God",
+	IgnoreMobNames = { "Minatoes" },
+
+-- ===== Keep Distance =====
+	MoveMethod = "auto",
+	ScanRadius = 110,
+	CellSize = 4,
+	MaxStep = 4,
+	DistanceTolerance = 3,
+
+-- ===== Auto Dodge (chỉ tele) =====
+	TeleCooldown = 0.4,
+	TeleMax = 60,
+	MobAttackRadius = 22,
+	DangerPadding = 2,
+	DangerTTL = 6,
+	DangerKeywords = { "hitbox", "aoe", "warning", "telegraph", "danger", "indicator", "shockwave", "blast" },
+	AttackAnimKeywords = { "attack", "skill", "slam", "smash", "punch", "kick", "slash", "swing", "cast",
+		"charge", "beam", "blast", "ultimate", "special", "stomp", "strike", "move1", "move2", "move3", "move4" },
+	IgnoreAnimKeywords = { "idle", "walk", "run", "move", "jump", "fall", "climb", "swim", "stand", "sit", "emote" },
+	DebugPrint = false,
+
+-- ===== Né chiêu Statue of God (cột đỏ / laser dự phòng) =====
+	TelegraphMinSize = 8,
+	TelegraphMaxSize = 90,
+	TelegraphMaxThick = 2.5,
+	TelegraphPadding = 3,
+	TelegraphNearBoss = 90,
+	ColumnRadius = 18,
+	LaserKeywords = { "laser", "beam" },
+	LaserAnimKeywords = { "laser", "beam", "eyes", "eyebeam" },
+	LaserPadding = 7,
+	LaserMinLength = 14,
+	LaserSidestepEvery = 0.9,
+
+-- ===== Né chiêu theo LOG (quét Workspace.FX liên tục) =====
+	FxScanInterval = 0.08,
+	IndicatorRadius = 9,
+	RedCircleRadius = 30,
+	PillarKeywords = { "pillar", "icefloor" },
+	PillarPadding = 4,
+	CircleNames = { "cylinder", "circle", "indicator", "aoe", "warning", "telegraph", "danger", "hitbox", "zone" },
+	SkillHoldAfterDodge = 0.3,
+	IgnoreFxNames = {
+		tpfx = true, hit1 = true, handle = true, head = true, torso = true,
+		["right leg"] = true, ["left leg"] = true, ["right arm"] = true, ["left arm"] = true,
+		debree = true, dust = true, part = true, firebeam = true,
+	},
+
+-- Nút "Ghi log chiêu": số giây ghi
+	LogSeconds = 25,
+}
+
+local parentGui = playerGui
+pcall(function()
+	if gethui then parentGui = gethui() end
+end)
+
+for _, p in ipairs({ playerGui, parentGui }) do
+	local old = p:FindFirstChild("LotScript")
+	if old then old:Destroy() end
+end
+pcall(function() RunService:UnbindFromRenderStep("LotScriptMove") end) -- tên cũ của các bản trước
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "LotScript"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = parentGui
+
+local conns = {}
+local function track(c) table.insert(conns, c) return c end
+
+local COLOR_BG = Color3.fromRGB(25, 25, 30)
+local COLOR_TOP = Color3.fromRGB(40, 40, 50)
+local COLOR_SIDE = Color3.fromRGB(32, 32, 40)
+local COLOR_BTN = Color3.fromRGB(50, 50, 62)
+local COLOR_BTN_ACTIVE = Color3.fromRGB(90, 90, 220)
+local COLOR_ON = Color3.fromRGB(50, 170, 90)
+local COLOR_OFF = Color3.fromRGB(170, 55, 55)
+local COLOR_TEXT = Color3.fromRGB(255, 255, 255)
+local COLOR_DIM = Color3.fromRGB(170, 170, 180)
+
+local teleDistance = 10
+local targetOn, keepOn, dodgeOn = false, false, false
+local keepDistance = 30
+local currentTarget, currentMob = nil, nil
+local learnMode, learnUntil, learnLog = nil, 0, {}
+local desiredPoint = nil
+
+-- Z: trạng thái/hàm của hệ thống vùng nguy hiểm (gom vào 1 bảng để tiết kiệm biến local)
+local Z = {
+	hold = 0,
+	lastFx = 0,
+	info = setmetatable({}, { __mode = "k" }),
+	seen = setmetatable({}, { __mode = "k" }),
+}
+
+local function dbg(...)
+	if CONFIG.DebugPrint then print("[LotScript]", ...) end
+end
+
+local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+
+local function matchAny(str, list)
+	for _, w in ipairs(list) do
+		if str:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+local function normText(s)
+	return (s:lower():gsub("[%s%p_]", ""))
+end
+
+----------------------------------------------------------------
+-- Hàm tiện ích UI
+----------------------------------------------------------------
+local function corner(obj, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = obj
+end
+
+local function makeLabel(parent, text, pos, size, textSize, color)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Position = pos
+	l.Size = size
+	l.Text = text
+	l.TextColor3 = color or COLOR_TEXT
+	l.Font = Enum.Font.Gotham
+	l.TextSize = textSize or 12
+	l.TextWrapped = true
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = parent
+	return l
+end
+
+local function makeBox(parent, default, pos, size)
+	local b = Instance.new("TextBox")
+	b.Position = pos
+	b.Size = size
+	b.BackgroundColor3 = COLOR_BTN
+	b.Text = tostring(default)
+	b.TextColor3 = COLOR_TEXT
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 14
+	b.ClearTextOnFocus = false
+	b.Parent = parent
+	corner(b, 6)
+	return b
+end
+
+local function makeSmallButton(parent, text, pos, size, onClick)
+	local b = Instance.new("TextButton")
+	b.Position = pos
+	b.Size = size
+	b.BackgroundColor3 = COLOR_BTN
+	b.Text = text
+	b.TextColor3 = COLOR_TEXT
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.TextWrapped = true
+	b.Parent = parent
+	corner(b, 6)
+	b.MouseButton1Click:Connect(onClick)
+	return b
+end
+
+local function makeToggle(parent, text, pos, size, onChange)
+	local btn = Instance.new("TextButton")
+	btn.Position = pos
+	btn.Size = size
+	btn.BackgroundColor3 = COLOR_OFF
+	btn.Text = text .. ": OFF"
+	btn.TextColor3 = COLOR_TEXT
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 13
+	btn.TextWrapped = true
+	btn.Parent = parent
+	corner(btn, 6)
+
+local state = false
+	local function set(v)
+		state = v
+		btn.BackgroundColor3 = v and COLOR_ON or COLOR_OFF
+		btn.Text = text .. ": " .. (v and "ON" or "OFF")
+		if onChange then onChange(v) end
+	end
+	btn.MouseButton1Click:Connect(function() set(not state) end)
+	return set, function() return state end
+end
+
+local function makeDraggable(handle, target, onTap)
+	local dragging = false
+	local moved = false
+	local dragStart, startPos
+
+handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			moved = false
+			dragStart = input.Position
+			startPos = target.Position
+
+input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if not moved and onTap then onTap() end
+				end
+			end)
+		end
+	end)
+
+track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 4 then moved = true end
+			target.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end))
+end
+
+----------------------------------------------------------------
+-- MENU
+----------------------------------------------------------------
+local menu = Instance.new("Frame")
+menu.Name = "Menu"
+menu.Size = UDim2.fromOffset(500, 300)
+menu.Position = UDim2.new(0.5, -250, 0.5, -150)
+menu.BackgroundColor3 = COLOR_BG
+menu.BorderSizePixel = 0
+menu.Parent = gui
+corner(menu, 10)
+
+local topBar = Instance.new("Frame")
+topBar.Name = "TopBar"
+topBar.Size = UDim2.new(1, 0, 0, 30)
+topBar.BackgroundColor3 = COLOR_TOP
+topBar.BorderSizePixel = 0
+topBar.Parent = menu
+corner(topBar, 10)
+
+local title = makeLabel(topBar, "LotScript", UDim2.new(0, 10, 0, 0), UDim2.new(1, -50, 1, 0), 16)
+title.Font = Enum.Font.GothamBold
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Name = "Minimize"
+minimizeBtn.Size = UDim2.fromOffset(24, 24)
+minimizeBtn.Position = UDim2.new(1, -30, 0, 3)
+minimizeBtn.BackgroundColor3 = COLOR_BTN
+minimizeBtn.Text = "-"
+minimizeBtn.TextColor3 = COLOR_TEXT
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 18
+minimizeBtn.Parent = topBar
+corner(minimizeBtn, 6)
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.new(1, 0, 1, -30)
+body.Position = UDim2.new(0, 0, 0, 30)
+body.BackgroundTransparency = 1
+body.Parent = menu
+
+local sidebar = Instance.new("Frame")
+sidebar.Name = "Categories"
+sidebar.Size = UDim2.new(0.2, 0, 1, 0)
+sidebar.BackgroundColor3 = COLOR_SIDE
+sidebar.BorderSizePixel = 0
+sidebar.Parent = body
+corner(sidebar, 8)
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(0.8, 0, 1, 0)
+content.Position = UDim2.new(0.2, 0, 0, 0)
+content.BackgroundTransparency = 1
+content.Parent = body
+
+local contentLabel = makeLabel(content, "Coming Soon", UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 1, 0), 28)
+contentLabel.Font = Enum.Font.GothamBold
+contentLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+local function makePage()
+	local f = Instance.new("ScrollingFrame")
+	f.Size = UDim2.new(1, 0, 1, 0)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.ScrollBarThickness = 4
+	f.CanvasSize = UDim2.new(0, 0, 0, 300)
+	f.Visible = false
+	f.Parent = content
+	return f
+end
+
+----------------------------------------------------------------
+-- Tiện ích nhân vật
+----------------------------------------------------------------
+local function getChar()
+	local c = player.Character
+	if not c then return nil end
+	return c, c:FindFirstChild("HumanoidRootPart"), c:FindFirstChildOfClass("Humanoid")
+end
+
+local function pressKey(keyCode)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+		task.wait(0.05)
+		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+-- Chỉ dùng chiêu khi đã đi tới đúng khoảng cách Distance quanh boss (khi Keep Distance bật)
+local function inSkillRange()
+	if not keepOn then return true end
+	local _, hrp = getChar()
+	if not (hrp and currentTarget and currentTarget.Parent) then return false end
+	local d = flat(hrp.Position - currentTarget.Position).Magnitude
+	return d <= keepDistance + CONFIG.DistanceTolerance
+end
+
+----------------------------------------------------------------
+-- TRANG FARM
+----------------------------------------------------------------
+local farmPage = makePage()
+farmPage.CanvasSize = UDim2.new(0, 0, 0, 335)
+
+-- cụm Auto Skill (bọc do...end để giải phóng biến local)
+do
+	local skillDefs = {
+		{ name = "1",      key = Enum.KeyCode.One },
+		{ name = "2",      key = Enum.KeyCode.Two },
+		{ name = "3",      key = Enum.KeyCode.Three },
+		{ name = "4",      key = Enum.KeyCode.Four },
+		{ name = "Assist", key = CONFIG.AssistKey },
+	}
+
+local autoSkill = false
+	local delayBetween = 0.5
+	local order = {}
+
+makeToggle(farmPage, "Auto Skill", UDim2.new(0, 8, 0, 8), UDim2.new(0.55, -8, 0, 34), function(v)
+		autoSkill = v
+	end)
+
+makeLabel(farmPage, "Delay(s)", UDim2.new(0.55, 8, 0, 8), UDim2.new(0.2, 0, 0, 34), 12, COLOR_DIM)
+	local delayBox = makeBox(farmPage, delayBetween, UDim2.new(0.75, 4, 0, 8), UDim2.new(0.25, -12, 0, 34))
+	delayBox.FocusLost:Connect(function()
+		local n = tonumber(delayBox.Text)
+		if n and n >= 0.1 then delayBetween = n end
+		delayBox.Text = tostring(delayBetween)
+	end)
+
+makeLabel(farmPage, "Bấm chiêu theo thứ tự muốn dùng, bấm lại để bỏ. Khi bật Auto Dodge, đang bị chiêu boss thì tele né xong mới bấm chiêu tiếp. Khi bật Keep Distance chỉ dùng chiêu khi đã đúng khoảng cách.",
+		UDim2.new(0, 8, 0, 46), UDim2.new(1, -16, 0, 30), 10, COLOR_DIM)
+
+local chips = {}
+	local orderLabel = makeLabel(farmPage, "", UDim2.new(0, 8, 0, 128), UDim2.new(1, -16, 0, 18), 12)
+
+local function refreshChips()
+		local names = {}
+		for _, chip in ipairs(chips) do
+			chip.btn.BackgroundColor3 = COLOR_BTN
+			chip.btn.Text = chip.def.name
+		end
+		for pos, idx in ipairs(order) do
+			local chip = chips[idx]
+			chip.btn.BackgroundColor3 = COLOR_BTN_ACTIVE
+			chip.btn.Text = chip.def.name .. "\n[" .. pos .. "]"
+			table.insert(names, chip.def.name)
+		end
+		orderLabel.Text = (#names > 0) and ("Thứ tự: " .. table.concat(names, " → ")) or "Chưa chọn chiêu nào"
+	end
+
+for i, def in ipairs(skillDefs) do
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(0.2, -8, 0, 46)
+		btn.Position = UDim2.new(0.2 * (i - 1), 6, 0, 78)
+		btn.BackgroundColor3 = COLOR_BTN
+		btn.Text = def.name
+		btn.TextColor3 = COLOR_TEXT
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 15
+		btn.TextWrapped = true
+		btn.Parent = farmPage
+		corner(btn, 8)
+		chips[i] = { btn = btn, def = def }
+
+btn.MouseButton1Click:Connect(function()
+			local at = table.find(order, i)
+			if at then table.remove(order, at) else table.insert(order, i) end
+			refreshChips()
+		end)
+	end
+	refreshChips()
+
+task.spawn(function()
+		while gui.Parent do
+			if autoSkill and #order > 0 and not learnMode then
+				if inSkillRange() then
+					for _, idx in ipairs(table.clone(order)) do
+						if not autoSkill or learnMode then break end
+						-- ƯU TIÊN NÉ: đang trong vùng chiêu boss -> chờ tele xong mới bấm chiêu
+						while autoSkill and dodgeOn and os.clock() < Z.hold do task.wait(0.03) end
+						if not autoSkill or learnMode or not inSkillRange() then break end
+						pressKey(skillDefs[idx].key)
+						task.wait(delayBetween)
+					end
+				else
+					task.wait(0.1)
+				end
+			else
+				task.wait(0.2)
+			end
+		end
+	end)
+end
+
+makeLabel(farmPage, "Auto sau trận (vote bằng remote / hàm của nút, KHÔNG bấm màn hình)",
+	UDim2.new(0, 8, 0, 154), UDim2.new(1, -16, 0, 18), 11, COLOR_DIM)
+
+local voteMode = nil
+local voted = false
+local setReplay, setNext
+local voteScanOnce = false
+local scanVoteStrings
+
+setReplay = makeToggle(farmPage, "Auto Replay", UDim2.new(0, 8, 0, 176), UDim2.new(0.5, -12, 0, 34), function(v)
+	voted = false
+	if v then
+		voteMode = "replay"
+		if setNext then setNext(false) end
+		if not voteScanOnce and scanVoteStrings then voteScanOnce = true; task.spawn(scanVoteStrings, true) end
+	elseif voteMode == "replay" then
+		voteMode = nil
+	end
+end)
+
+setNext = makeToggle(farmPage, "Auto Next Act", UDim2.new(0.5, 4, 0, 176), UDim2.new(0.5, -12, 0, 34), function(v)
+	voted = false
+	if v then
+		voteMode = "next"
+		if setReplay then setReplay(false) end
+		if not voteScanOnce and scanVoteStrings then voteScanOnce = true; task.spawn(scanVoteStrings, true) end
+	elseif voteMode == "next" then
+		voteMode = nil
+	end
+end)
+
+local voteStatus = makeLabel(farmPage, "Chờ màn hình kết quả. Có thể bấm 'Học' rồi bấm nút thật trong game để học remote.",
+	UDim2.new(0, 8, 0, 214), UDim2.new(1, -16, 0, 34), 11, COLOR_DIM)
+
+-- toàn bộ hệ thống vote bọc trong do ... end
+do
+----------------------------------------------------------------
+-- Remote: học / dò / gửi
+----------------------------------------------------------------
+local VOTE_WORDS = { "replay", "retry", "next", "vote", "again", "continue", "restart" }
+local NOISE_WORDS = { "move", "walk", "camera", "ping", "heartbeat", "input", "mouse", "key", "skill",
+	"attack", "combat", "punch", "dash", "dodge", "cooldown", "sprint", "run", "ability" }
+
+local learned = {}
+local hookOk = false
+
+pcall(function()
+	if hookmetamethod and getnamecallmethod then
+		local old
+		local function handler(self, ...)
+			local m = getnamecallmethod()
+			if learnMode and os.clock() < learnUntil and (m == "FireServer" or m == "InvokeServer") then
+				if typeof(self) == "Instance" and (self.ClassName == "RemoteEvent" or self.ClassName == "RemoteFunction") then
+					table.insert(learnLog, { remote = self, method = m, args = table.pack(...) })
+				end
+			end
+			return old(self, ...)
+		end
+		old = hookmetamethod(game, "__namecall", newcclosure and newcclosure(handler) or handler)
+		hookOk = true
+	end
+end)
+
+local function argsToString(args)
+	local t = {}
+	for i = 1, (args.n or #args) do t[i] = tostring(args[i]) end
+	return table.concat(t, ", ")
+end
+
+local function finishLearn(mode, strict)
+	local best, bestScore
+	for idx, e in ipairs(learnLog) do
+		local name = e.remote.Name:lower()
+		local score = idx * 0.01
+		for _, w in ipairs(NOISE_WORDS) do
+			if name:find(w, 1, true) then score -= 5 break end
+		end
+		for _, w in ipairs(VOTE_WORDS) do
+			if name:find(w, 1, true) then score += 3 end
+			for i = 1, e.args.n do
+				local a = e.args[i]
+				if type(a) == "string" and a:lower():find(w, 1, true) then score += 4 end
+			end
+		end
+		if not bestScore or score > bestScore then best, bestScore = e, score end
+	end
+	learnLog = {}
+	local need = strict and 3 or -4
+	if best and bestScore >= need then
+		learned[mode] = best
+		local info = best.remote:GetFullName() .. " (" .. argsToString(best.args) .. ")"
+		print("[LotScript] Đã học " .. mode .. ": " .. info)
+		voteStatus.Text = "Đã học " .. mode .. ": " .. best.remote.Name .. " (" .. argsToString(best.args) .. ")"
+		return true
+	end
+	if not strict then
+		voteStatus.Text = "Không bắt được remote nào. Thử lại và bấm nút thật trong game ngay sau khi bấm Học."
+	end
+	return false
+end
+
+local function startLearn(mode, label)
+	if not hookOk then
+		voteStatus.Text = "Executor không hỗ trợ hook. Dùng 'Quét remote'."
+		return
+	end
+	learnLog = {}
+	learnMode = mode
+	learnUntil = os.clock() + 8
+	voteStatus.Text = "BẤM NÚT " .. label .. " THẬT trong game ngay (8 giây)..."
+	task.delay(8.2, function()
+		if learnMode == mode then
+			learnMode = nil
+			finishLearn(mode, false)
+		end
+	end)
+end
+
+local remoteCache, remoteCacheAt = nil, 0
+local function allRemotes()
+	if remoteCache and os.clock() - remoteCacheAt < 5 then return remoteCache end
+	local out = {}
+	for _, v in ipairs(game:GetDescendants()) do
+		if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") then table.insert(out, v) end
+	end
+	remoteCache, remoteCacheAt = out, os.clock()
+	return out
+end
+
+local function fireRemote(r, args)
+	task.spawn(function()
+		pcall(function()
+			local n = args.n or #args
+			if r:IsA("RemoteFunction") then
+				r:InvokeServer(table.unpack(args, 1, n))
+			else
+				r:FireServer(table.unpack(args, 1, n))
+			end
+		end)
+	end)
+end
+
+scanVoteStrings = function(quiet)
+	local found = {}
+	local ok = pcall(function()
+		if not (getgc and debug and debug.getconstants) then error("no api") end
+		local n = 0
+		for _, f in ipairs(getgc()) do
+			if type(f) == "function" and (not islclosure or islclosure(f)) then
+				local okc, consts = pcall(debug.getconstants, f)
+				if okc and type(consts) == "table" then
+					for _, c in ipairs(consts) do
+						if type(c) == "string" and #c >= 4 and #c <= 32 and c:match("^Vote%w*\$") then
+							found[c] = true
+						end
+					end
+				end
+			end
+			n += 1
+			if n % 4000 == 0 then task.wait() end
+			if n > 120000 then break end
+		end
+	end)
+	local list = {}
+	for s in pairs(found) do table.insert(list, s) end
+	table.sort(list)
+	for _, s in ipairs(list) do
+		print("[LotScript] Lệnh Vote:", s)
+		local low = s:lower()
+		local mode = low:find("replay", 1, true) and "replay" or (low:find("next", 1, true) and "next") or nil
+		if mode then
+			local cands = CONFIG.VoteArgCandidates[mode]
+			local exists = false
+			for _, a in ipairs(cands) do if a[1] == s and #a == 1 then exists = true break end end
+			if not exists then table.insert(cands, 1, { s }) end
+		end
+	end
+	if not quiet then
+		if ok and #list > 0 then
+			voteStatus.Text = "Lệnh Vote tìm thấy: " .. table.concat(list, ", ")
+		elseif ok then
+			voteStatus.Text = "Không thấy chuỗi Vote nào trong code game."
+		else
+			voteStatus.Text = "Executor không hỗ trợ quét code (getgc/getconstants)."
+		end
+	end
+end
+
+local function scanRemotes()
+	local found = {}
+	for _, v in ipairs(allRemotes()) do
+		local n = v.Name:lower()
+		if matchAny(n, VOTE_WORDS) then table.insert(found, v:GetFullName()) end
+	end
+	for _, p in ipairs(found) do print("[LotScript] Remote:", p) end
+	voteStatus.Text = (#found == 0) and "Không thấy remote tên replay/next/vote." or
+		("Tìm thấy " .. #found .. " remote (xem đủ ở console F9). Đang quét lệnh Vote...")
+	task.spawn(scanVoteStrings, false)
+end
+
+----------------------------------------------------------------
+-- Dò màn hình kết quả / nút
+----------------------------------------------------------------
+local function isVisible(obj)
+	local cur = obj
+	while cur and cur ~= playerGui and cur ~= game do
+		if cur:IsA("GuiObject") and not cur.Visible then return false end
+		if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+		cur = cur.Parent
+	end
+	return true
+end
+
+local function resultScreenShown()
+	for _, v in ipairs(playerGui:GetDescendants()) do
+		if (v:IsA("TextLabel") or v:IsA("TextButton")) and not v:IsDescendantOf(gui) then
+			local t = v.Text:upper()
+			if (t:find("VICTORY", 1, true) or t:find("DEFEAT", 1, true) or t:find("AUTO-RETURN", 1, true))
+				and isVisible(v) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local voteKeys = { replay = { "replay" }, next = { "nextact" } }
+
+local function findVoteLabel(mode)
+	local keys = voteKeys[mode]
+	for _, v in ipairs(playerGui:GetDescendants()) do
+		if (v:IsA("TextLabel") or v:IsA("TextButton")) and not v:IsDescendantOf(gui) then
+			local t = normText(v.Text)
+			for _, k in ipairs(keys) do
+				if t == k and isVisible(v) and v.AbsoluteSize.X > 0 then return v end
+			end
+		end
+	end
+	for _, v in ipairs(playerGui:GetDescendants()) do
+		if v:IsA("GuiButton") and not v:IsDescendantOf(gui) then
+			local n = normText(v.Name)
+			for _, k in ipairs(keys) do
+				if n:find(k, 1, true) and isVisible(v) and v.AbsoluteSize.X > 0 then return v end
+			end
+		end
+	end
+	return nil
+end
+
+local function getVotes(obj)
+	local center = obj.AbsolutePosition + obj.AbsoluteSize / 2
+	local cur = obj
+	for _ = 1, 3 do
+		cur = cur and cur.Parent
+		if not cur then break end
+		local best, bestDist
+		for _, v in ipairs(cur:GetDescendants()) do
+			if v:IsA("TextLabel") then
+				local n = v.Text:upper():match("VOTES%s*(%d+)")
+				if n then
+					local d = (v.AbsolutePosition + v.AbsoluteSize / 2 - center).Magnitude
+					if not bestDist or d < bestDist then best, bestDist = tonumber(n), d end
+				end
+			end
+		end
+		if best then return best end
+	end
+	return nil
+end
+
+local function voteSucceeded(mode)
+	local lbl = findVoteLabel(mode)
+	if lbl then
+		local v = getVotes(lbl)
+		if v and v >= 1 then return true end
+	end
+	return false
+end
+
+local function collectHandlers(obj)
+	local list, seen = {}, {}
+	local function add(o)
+		if o and not seen[o] and not o:IsDescendantOf(gui) then
+			seen[o] = true
+			table.insert(list, o)
+		end
+	end
+	local cur = obj
+	for _ = 1, 6 do
+		if cur and cur:IsA("GuiObject") then add(cur) end
+		cur = cur and cur.Parent
+	end
+	pcall(function()
+		local c = obj.AbsolutePosition + obj.AbsoluteSize / 2
+		for _, o in ipairs(playerGui:GetGuiObjectsAtPosition(c.X, c.Y)) do add(o) end
+	end)
+	return list
+end
+
+local function fakeInput(state)
+	return {
+		UserInputType = Enum.UserInputType.MouseButton1,
+		UserInputState = state,
+		Position = Vector3.new(0, 0, 0),
+		Delta = Vector3.new(0, 0, 0),
+		KeyCode = Enum.KeyCode.Unknown,
+	}
+end
+
+local SIGS = { "Activated", "MouseButton1Click", "MouseButton1Down", "MouseButton1Up", "TouchTap", "InputBegan", "InputEnded" }
+
+local function fireHandlers(objs)
+	for _, o in ipairs(objs) do
+		for _, sg in ipairs(SIGS) do
+			pcall(function()
+				local sig = o[sg]
+				local isInput = (sg == "InputBegan" or sg == "InputEnded")
+				local arg = isInput and fakeInput(sg == "InputBegan" and Enum.UserInputState.Begin or Enum.UserInputState.End)
+				if getconnections then
+					for _, c in ipairs(getconnections(sig)) do
+						if isInput then
+							c:Fire(arg)
+						elseif sg == "Activated" then
+							c:Fire(fakeInput(Enum.UserInputState.End), 1)
+						else
+							c:Fire()
+						end
+					end
+				elseif firesignal then
+					if isInput then firesignal(sig, arg) else firesignal(sig) end
+				end
+			end)
+		end
+	end
+end
+
+local function captureHandlers(mode, objs)
+	if not hookOk then
+		fireHandlers(objs)
+		return
+	end
+	learnLog = {}
+	learnMode = mode
+	learnUntil = os.clock() + 1.5
+	fireHandlers(objs)
+	task.wait(0.6)
+	learnMode = nil
+	finishLearn(mode, true)
+end
+
+----------------------------------------------------------------
+-- Các cách vote
+----------------------------------------------------------------
+local variantPtr = { replay = 0, next = 0 }
+local working = {}
+local lastMethod = {}
+
+local voteMethods = {}
+
+voteMethods.learned = function(mode)
+	local L = learned[mode]
+	if L and L.remote and L.remote.Parent then
+		fireRemote(L.remote, L.args)
+		return "remote đã học " .. L.remote.Name .. "(" .. argsToString(L.args) .. ")"
+	end
+	return nil
+end
+
+voteMethods.config = function(mode)
+	local cfg = (mode == "replay") and CONFIG.ReplayRemote or CONFIG.NextActRemote
+	local n = 0
+	for _, r in ipairs(allRemotes()) do
+		if (cfg.name ~= "" and r.Name == cfg.name) then
+			fireRemote(r, cfg.args)
+			n += 1
+		end
+	end
+	if n == 0 and cfg.name == "" then
+		for _, k in ipairs(cfg.keywords) do
+			for _, r in ipairs(allRemotes()) do
+				if r.Name:lower():find(k, 1, true) then
+					fireRemote(r, cfg.args)
+					n += 1
+				end
+			end
+			if n > 0 then break end
+		end
+	end
+	if n > 0 then return "remote CONFIG " .. cfg.name .. "(" .. argsToString(cfg.args) .. ")" end
+	return nil
+end
+
+voteMethods.handler = function(mode)
+	local lbl = findVoteLabel(mode)
+	if not lbl then return nil end
+	captureHandlers(mode, collectHandlers(lbl))
+	return "hàm xử lý của nút " .. lbl.Name
+end
+
+voteMethods.variants = function(mode)
+	local cfg = (mode == "replay") and CONFIG.ReplayRemote or CONFIG.NextActRemote
+	local remotes = {}
+	for _, r in ipairs(allRemotes()) do
+		if cfg.name ~= "" and r.Name == cfg.name then table.insert(remotes, r) end
+	end
+	if #remotes == 0 then
+		for _, r in ipairs(allRemotes()) do
+			if matchAny(r.Name:lower(), VOTE_WORDS) then table.insert(remotes, r) end
+		end
+	end
+	if #remotes == 0 then return nil end
+	local cands = CONFIG.VoteArgCandidates[mode]
+	variantPtr[mode] = variantPtr[mode] % #cands + 1
+	local args = cands[variantPtr[mode]]
+	for _, r in ipairs(remotes) do fireRemote(r, args) end
+	return "thử " .. remotes[1].Name .. "(" .. table.concat(args, ", ") .. ")"
+end
+
+local DEFAULT_ORDER = { "learned", "config", "handler", "variants", "variants", "variants" }
+
+local function runVoteAttempt(mode, n)
+	local order = DEFAULT_ORDER
+	if working[mode] and n <= 2 then order = { working[mode] } end
+	for k = 0, #order - 1 do
+		local name = order[((n - 1 + k) % #order) + 1]
+		local desc = voteMethods[name](mode)
+		if desc then
+			lastMethod[mode] = name
+			voteStatus.Text = "Lần " .. n .. ": " .. desc
+			print("[LotScript] Vote " .. mode .. " lần " .. n .. ": " .. desc)
+			return true
+		end
+	end
+	voteStatus.Text = "Lần " .. n .. ": chưa có cách nào áp dụng được (bấm 'Học' hoặc 'Quét remote')."
+	return false
+end
+
+local manualAttempts = 0
+
+makeSmallButton(farmPage, "Học Replay", UDim2.new(0, 8, 0, 252), UDim2.new(0.25, -8, 0, 30), function()
+	startLearn("replay", "REPLAY")
+end)
+makeSmallButton(farmPage, "Học Next", UDim2.new(0.25, 2, 0, 252), UDim2.new(0.25, -6, 0, 30), function()
+	startLearn("next", "NEXT ACT")
+end)
+makeSmallButton(farmPage, "Quét remote", UDim2.new(0.5, 0, 0, 252), UDim2.new(0.25, -6, 0, 30), scanRemotes)
+makeSmallButton(farmPage, "Vote ngay", UDim2.new(0.75, -2, 0, 252), UDim2.new(0.25, -6, 0, 30), function()
+	manualAttempts += 1
+	task.spawn(runVoteAttempt, voteMode or "replay", manualAttempts)
+end)
+
+task.spawn(function()
+	local attempts, lastAttempt = 0, 0
+	while gui.Parent do
+		if voteMode and not learnMode then
+			local shown = (not CONFIG.RequireResultScreen) or resultScreenShown()
+			if shown then
+				if voteSucceeded(voteMode) then
+					if not voted then
+						voted = true
+						if lastMethod[voteMode] then working[voteMode] = lastMethod[voteMode] end
+						voteStatus.Text = "Đã vote thành công sau " .. attempts .. " lần thử."
+					end
+				else
+					local lbl = findVoteLabel(voteMode)
+					local gap = (lbl and getVotes(lbl) ~= nil) and 1.5 or 2.5
+					if os.clock() - lastAttempt >= gap then
+						lastAttempt = os.clock()
+						attempts += 1
+						pcall(runVoteAttempt, voteMode, attempts)
+					end
+				end
+			else
+				voted = false
+				attempts = 0
+				if voteMode then voteStatus.Text = "Chờ màn hình kết quả (Victory/Defeat)..." end
+			end
+		end
+		task.wait(0.3)
+	end
+end)
+end -- hết cụm vote
+
+----------------------------------------------------------------
+-- TRANG RAID
+----------------------------------------------------------------
+local raidPage = makePage()
+raidPage.CanvasSize = UDim2.new(0, 0, 0, 320)
+
+local ignoreSet = {}
+for _, n in ipairs(CONFIG.IgnoreMobNames) do ignoreSet[n] = true end
+
+local requestScan
+local resetPath
+local startActionLog
+local logging = false
+
+makeToggle(raidPage, "Auto Target Boss", UDim2.new(0, 8, 0, 8), UDim2.new(1, -16, 0, 34), function(v)
+	targetOn = v
+	if not v then
+		local _, _, hum = getChar()
+		if hum then hum.AutoRotate = true end
+	end
+end)
+
+makeLabel(raidPage, "Luôn xoay mặt nhân vật về boss. Không teleport, không iframe.",
+	UDim2.new(0, 8, 0, 46), UDim2.new(1, -16, 0, 26), 11, COLOR_DIM)
+
+local targetStatus = makeLabel(raidPage, "Mục tiêu: chưa có", UDim2.new(0, 8, 0, 72), UDim2.new(1, -16, 0, 20), 12)
+
+local ddHeader = makeLabel(raidPage, "Distance & Dodge", UDim2.new(0, 8, 0, 96), UDim2.new(1, -16, 0, 18), 13)
+ddHeader.Font = Enum.Font.GothamBold
+
+makeToggle(raidPage, "Keep Distance", UDim2.new(0, 8, 0, 118), UDim2.new(0.55, -8, 0, 34), function(v)
+	keepOn = v
+	if resetPath then resetPath() end
+	desiredPoint = nil
+	if v and requestScan then requestScan(false) end
+end)
+
+makeLabel(raidPage, "Distance", UDim2.new(0.55, 8, 0, 118), UDim2.new(0.2, 0, 0, 34), 12, COLOR_DIM)
+local keepBox = makeBox(raidPage, keepDistance, UDim2.new(0.75, 4, 0, 118), UDim2.new(0.25, -12, 0, 34))
+keepBox.FocusLost:Connect(function()
+	local n = tonumber(keepBox.Text)
+	if n then keepDistance = math.clamp(n, 5, 300) end
+	keepBox.Text = tostring(keepDistance)
+end)
+
+makeToggle(raidPage, "Auto Dodge", UDim2.new(0, 8, 0, 158), UDim2.new(1, -16, 0, 34), function(v)
+	dodgeOn = v
+end)
+
+makeLabel(raidPage, "Dodge ưu tiên số 1: vòng đen/trụ băng/vòng đỏ được quét liên tục, đứng trong vùng là tele ra ngay (tạm dừng bấm chiêu + dừng đi bộ). Tele tới ô an toàn trên map, gần khoảng cách Distance.",
+	UDim2.new(0, 8, 0, 196), UDim2.new(1, -16, 0, 28), 10, COLOR_DIM)
+
+local keepStatus = makeLabel(raidPage, "Giữ khoảng cách: tắt", UDim2.new(0, 8, 0, 226), UDim2.new(1, -16, 0, 16), 11, COLOR_DIM)
+local dodgeStatus = makeLabel(raidPage, "Dodge: tắt", UDim2.new(0, 8, 0, 244), UDim2.new(1, -16, 0, 30), 11, COLOR_DIM)
+
+makeSmallButton(raidPage, "Quét lại map", UDim2.new(0, 8, 0, 280), UDim2.new(0.5, -12, 0, 28), function()
+	if requestScan then requestScan(true) end
+end)
+makeSmallButton(raidPage, "Ghi log chiêu", UDim2.new(0.5, 0, 0, 280), UDim2.new(0.5, -12, 0, 28), function()
+	if startActionLog then startActionLog() end
+end)
+
+----------------------------------------------------------------
+-- Chọn mục tiêu: ưu tiên BOSS (Workspace.Living -> tên -> máu khớp UI -> máu lớn nhất)
+----------------------------------------------------------------
+local bossUiCache, bossUiAt = {}, 0
+local bossCache, bossCacheAt = nil, 0
+
+local function parseUiMax()
+	local set = {}
+	for _, v in ipairs(playerGui:GetDescendants()) do
+		if v:IsA("TextLabel") and not v:IsDescendantOf(gui) then
+			local a, b = v.Text:gsub(",", ""):match("^%s*(%d+)%s*/%s*(%d+)%s*\$")
+			if b and tonumber(b) >= 1000 then set[tonumber(b)] = true end
+		end
+	end
+	return set
+end
+
+local function findNearestMob(hrp)
+	local now = os.clock()
+
+if bossCache and now - bossCacheAt < 2 and bossCache.model.Parent and bossCache.root.Parent then
+		local h = bossCache.model:FindFirstChildOfClass("Humanoid")
+		if not h or h.Health > 0 then
+			return bossCache.root, (bossCache.root.Position - hrp.Position).Magnitude, bossCache.name, bossCache.model
+		end
+	end
+
+if now - bossUiAt > 1 then bossUiCache, bossUiAt = parseUiMax(), now end
+	local want = normText(CONFIG.BossName or "")
+
+-- đường nhanh: boss nằm trong Workspace.Living
+	if want ~= "" then
+		local living = workspace:FindFirstChild("Living")
+		if living then
+			for _, m in ipairs(living:GetChildren()) do
+				if m:IsA("Model") and m ~= player.Character and not ignoreSet[m.Name]
+					and not Players:GetPlayerFromCharacter(m) and normText(m.Name):find(want, 1, true) then
+					local h = m:FindFirstChildOfClass("Humanoid")
+					local r = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+					if h and h.Health > 0 and r then
+						local dist = (r.Position - hrp.Position).Magnitude
+						bossCache = { root = r, dist = dist, name = m.Name, model = m }
+						bossCacheAt = now
+						return r, dist, m.Name, m
+					end
+				end
+			end
+		end
+	end
+
+local best, bestScore
+
+local function consider(model, hum)
+		if not model or not model:IsA("Model") or model == player.Character
+			or Players:GetPlayerFromCharacter(model) or ignoreSet[model.Name] then
+			return
+		end
+		if hum then
+			if hum.Health <= 0 or hum.MaxHealth >= 1e9 or model:FindFirstChildOfClass("ForceField") then return end
+		end
+		local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+			or model:FindFirstChildWhichIsA("BasePart", true)
+		if not root then return end
+		local dist = (root.Position - hrp.Position).Magnitude
+		local score = -dist * 0.01
+		if hum then
+			score += math.min(hum.MaxHealth, 1e7) * 0.001
+			if bossUiCache[math.floor(hum.MaxHealth + 0.5)] then score += 1e8 end
+		else
+			score -= 5e8
+		end
+		if want ~= "" and normText(model.Name):find(want, 1, true) then score += 1e9 end
+		if not bestScore or score > bestScore then
+			best = { root = root, dist = dist, name = model.Name, model = model }
+			bestScore = score
+		end
+	end
+
+for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("Humanoid") then
+			consider(d.Parent, d)
+		elseif want ~= "" and d:IsA("Model") and normText(d.Name):find(want, 1, true) then
+			consider(d, d:FindFirstChildOfClass("Humanoid"))
+		end
+	end
+
+if not best then
+		bossCache = nil
+		return nil, math.huge, "", nil
+	end
+	bossCache, bossCacheAt = best, now
+	return best.root, best.dist, best.name, best.model
+end
+
+task.spawn(function()
+	while gui.Parent do
+		if targetOn or keepOn or dodgeOn or logging then
+			local _, hrp = getChar()
+			if hrp then
+				local root, dist, name, model = findNearestMob(hrp)
+				currentTarget = root
+				currentMob = model
+				targetStatus.Text = root and string.format("Mục tiêu: %s (%d studs)", name, math.floor(dist)) or "Mục tiêu: không thấy boss"
+			end
+		else
+			currentTarget, currentMob = nil, nil
+			bossCache = nil
+			targetStatus.Text = "Mục tiêu: chưa có"
+		end
+		task.wait(0.3)
+	end
+end)
+
+track(RunService.Heartbeat:Connect(function()
+	if not targetOn then return end
+	local _, hrp, hum = getChar()
+	if not hrp then return end
+	if hum then hum.AutoRotate = false end
+	if currentTarget and currentTarget.Parent then
+		local look = Vector3.new(currentTarget.Position.X, hrp.Position.Y, currentTarget.Position.Z)
+		if (look - hrp.Position).Magnitude > 0.1 then
+			hrp.CFrame = CFrame.lookAt(hrp.Position, look)
+		end
+	end
+end))
+
+----------------------------------------------------------------
+-- Tiện ích địa hình
+----------------------------------------------------------------
+local function excludeList()
+	local list = {}
+	if player.Character then table.insert(list, player.Character) end
+	if currentMob then table.insert(list, currentMob) end
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then table.insert(list, pl.Character) end
+	end
+	return list
+end
+
+local function rayParams()
+	local p = RaycastParams.new()
+	p.FilterType = Enum.RaycastFilterType.Exclude
+	p.FilterDescendantsInstances = excludeList()
+	p.RespectCanCollide = true
+	p.IgnoreWater = true
+	return p
+end
+
+local function overlapParams()
+	local p = OverlapParams.new()
+	p.FilterType = Enum.RaycastFilterType.Exclude
+	p.FilterDescendantsInstances = excludeList()
+	p.RespectCanCollide = true
+	return p
+end
+
+local function hipOffset()
+	local _, hrp, hum = getChar()
+	if not hrp then return 3 end
+	local hip = (hum and hum.HipHeight > 0) and hum.HipHeight or 2
+	return hip + hrp.Size.Y / 2
+end
+
+local function groundAt(p, refY)
+	local hit = workspace:Raycast(Vector3.new(p.X, refY + 12, p.Z), Vector3.new(0, -40, 0), rayParams())
+	if not hit then return nil end
+	local y = hit.Position.Y + hipOffset()
+	if y > refY + 8 then return nil end
+	return Vector3.new(p.X, y, p.Z)
+end
+
+local function spaceFree(pos)
+	local parts = workspace:GetPartBoundsInBox(CFrame.new(pos), Vector3.new(2.5, 3, 2.5), overlapParams())
+	return #parts == 0
+end
+
+----------------------------------------------------------------
+-- Vùng nguy hiểm (chiêu của boss)
+----------------------------------------------------------------
+local dangerParts = {}
+local dangerCircles = {}
+local laserParts = {}
+local beamList = setmetatable({}, { __mode = "k" })
+local beamsScanned = false
+local attackUntil, laserUntil = 0, 0
+local lastTrigger, lastAnim = "", ""
+local learnedNames, learnedAnims = {}, {}
+local recentCandidates = {}
+local virtualAim = nil
+
+local GENERIC = { Part = true, MeshPart = true, Union = true, Wedge = true, HumanoidRootPart = true,
+	Handle = true, Baseplate = true, Terrain = true, Head = true, Torso = true }
+
+local function isPlayerPart(inst)
+	local cur = inst.Parent
+	while cur and cur ~= workspace do
+		if cur:IsA("Model") and Players:GetPlayerFromCharacter(cur) then return true end
+		cur = cur.Parent
+	end
+	return false
+end
+
+local function insideRig(part)
+	local m = part:FindFirstAncestorOfClass("Model")
+	while m do
+		if m:FindFirstChildOfClass("Humanoid") then return true end
+		m = m:FindFirstAncestorOfClass("Model")
+	end
+	return false
+end
+
+local function biggest(p) return math.max(p.Size.X, p.Size.Y, p.Size.Z) end
+
+local function dims(p)
+	local t = { p.Size.X, p.Size.Y, p.Size.Z }
+	table.sort(t)
+	return t[1], t[2], t[3]
+end
+
+local function isRed(c)
+	return c.R > 0.55 and c.G < 0.4 and c.B < 0.4
+end
+
+local function longAxis(p)
+	local s = p.Size
+	local d1, d2, d3 = dims(p)
+	local axis
+	if s.X == d3 then axis = p.CFrame.RightVector
+	elseif s.Y == d3 then axis = p.CFrame.UpVector
+	else axis = p.CFrame.LookVector end
+	return axis, d3, d2
+end
+
+local function distToSeg(p, a, b)
+	local ab = flat(b - a)
+	local l2 = ab:Dot(ab)
+	if l2 < 1e-4 then return flat(p - a).Magnitude end
+	local t = math.clamp(flat(p - a):Dot(ab) / l2, 0, 1)
+	return flat(p - (a + (b - a) * t)).Magnitude
+end
+
+local function laserSegment(obj)
+	if obj:IsA("Beam") then
+		local a0, a1 = obj.Attachment0, obj.Attachment1
+		if a0 and a1 then
+			return a0.WorldPosition, a1.WorldPosition, math.max(obj.Width0, obj.Width1) / 2
+		end
+		return nil
+	end
+	local axis, len, wid = longAxis(obj)
+	local c = obj.Position
+	return c - axis * (len / 2), c + axis * (len / 2), wid / 2
+end
+
+local function telegraphMatch(part, color)
+	if part.CanCollide then return false end
+	local d1, d2, d3 = dims(part)
+	if d1 > CONFIG.TelegraphMaxThick or d2 < CONFIG.TelegraphMinSize or d3 > CONFIG.TelegraphMaxSize then
+		return false
+	end
+	local c = color or part.Color
+	local dark = (c.R + c.G + c.B) / 3 < 0.12
+	return isRed(c) or dark or matchAny(part.Name:lower(), CONFIG.DangerKeywords)
+end
+
+local function considerDanger(inst)
+	if not dodgeOn then return end
+	if inst:IsA("Beam") then
+		beamList[inst] = true
+		return
+	end
+
+if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+		local sg = inst:FindFirstAncestorOfClass("SurfaceGui")
+		if sg and sg:IsDescendantOf(workspace) then
+			local adornee = sg.Adornee or sg.Parent
+			if adornee and adornee:IsA("BasePart") and not isPlayerPart(adornee) and not insideRig(adornee) then
+				local d1, d2, d3 = dims(adornee)
+				if d1 <= CONFIG.TelegraphMaxThick and d2 >= CONFIG.TelegraphMinSize and d3 <= CONFIG.TelegraphMaxSize
+					and (isRed(inst.ImageColor3) or matchAny(inst.Name:lower(), CONFIG.DangerKeywords)) then
+					dangerParts[adornee] = os.clock() + CONFIG.DangerTTL
+					lastTrigger = "vòng ảnh " .. inst.Name
+				end
+			end
+		end
+		return
+	end
+
+local part, color = inst, nil
+	if inst:IsA("Decal") or inst:IsA("Texture") then
+		part, color = inst.Parent, inst.Color3
+	end
+	if not (part and part:IsA("BasePart")) or part == workspace.Terrain then return end
+	if isPlayerPart(part) then return end
+	local now = os.clock()
+	local nameL = part.Name:lower()
+	if CONFIG.IgnoreFxNames[nameL] then return end
+	if currentTarget and currentTarget.Parent
+		and (part.Position - currentTarget.Position).Magnitude > CONFIG.TelegraphNearBoss + 60 then
+		return
+	end
+
+if part == inst and not part.CanCollide then
+		local axis, len, wid = longAxis(part)
+		local vertical = math.abs(axis.Y) > 0.8
+
+if vertical and len >= 10 and len >= 3 * wid and not insideRig(part)
+			and (isRed(part.Color) or matchAny(nameL, CONFIG.DangerKeywords)) then
+			dangerCircles[part] = { exp = now + CONFIG.DangerTTL, r = CONFIG.ColumnRadius }
+			lastTrigger = "cột đỏ " .. part.Name
+			dbg("Column:", part:GetFullName())
+			return
+		end
+
+local kw = matchAny(nameL, CONFIG.LaserKeywords)
+		if (kw and len >= 6)
+			or (not vertical and len >= CONFIG.LaserMinLength and len >= 4 * wid and wid <= 10 and not insideRig(part)) then
+			laserParts[part] = now + CONFIG.DangerTTL + 2
+			lastTrigger = "laser " .. part.Name
+			dbg("Laser part:", part:GetFullName())
+			return
+		end
+	end
+
+if learnedNames[part.Name] or matchAny(nameL, CONFIG.DangerKeywords) then
+		dangerParts[part] = now + CONFIG.DangerTTL
+		lastTrigger = "part " .. part.Name
+		dbg("Danger part:", part:GetFullName())
+		return
+	end
+
+if not insideRig(part) and telegraphMatch(part, color) then
+		dangerParts[part] = now + CONFIG.DangerTTL
+		lastTrigger = "vòng cảnh báo " .. part.Name
+		dbg("Telegraph:", part:GetFullName(), part.Color)
+		return
+	end
+
+if inst ~= part then return end
+
+if part.CanCollide or biggest(part) < 4 then return end
+	if not currentTarget or (part.Position - currentTarget.Position).Magnitude > 150 then return end
+	if now <= attackUntil + 0.6 then
+		dangerParts[part] = now + CONFIG.DangerTTL
+		lastTrigger = "part lạ " .. part.Name
+	else
+		table.insert(recentCandidates, { part = part, t = now })
+		if #recentCandidates > 40 then table.remove(recentCandidates, 1) end
+	end
+end
+track(workspace.DescendantAdded:Connect(function(i) task.defer(considerDanger, i) end))
+
+local function scanBeams()
+	local now = os.clock()
+	for b in pairs(beamList) do
+		if b.Parent and b.Enabled and b.Attachment0 and b.Attachment1
+			and math.max(b.Width0, b.Width1) >= 1.5
+			and not isPlayerPart(b.Attachment0.Parent)
+			and (b.Attachment1.WorldPosition - b.Attachment0.WorldPosition).Magnitude >= CONFIG.LaserMinLength then
+			laserParts[b] = now + 0.3
+			lastTrigger = "beam " .. b.Name
+		end
+	end
+end
+
+----------------------------------------------------------------
+-- QUÉT FX THỜI GIAN THỰC + DỰNG VÙNG NGUY HIỂM
+----------------------------------------------------------------
+function Z.flatRadius(part)
+	local s = part.Size
+	local thin = math.min(s.X, s.Y, s.Z)
+	local big = math.max(s.X, s.Y, s.Z)
+	if thin > 2.5 then return nil end
+	local axis
+	if s.X == thin then axis = part.CFrame.RightVector
+	elseif s.Y == thin then axis = part.CFrame.UpVector
+	else axis = part.CFrame.LookVector end
+	if math.abs(axis.Y) < 0.8 then return nil end
+	local mid = s.X + s.Y + s.Z - thin - big
+	if mid < big * 0.6 then return nil end
+	return big / 2
+end
+
+function Z.footprint(part)
+	local cf, s = part.CFrame, part.Size
+	local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
+	local hx = (math.abs(r.X) * s.X + math.abs(u.X) * s.Y + math.abs(l.X) * s.Z) / 2
+	local hz = (math.abs(r.Z) * s.X + math.abs(u.Z) * s.Y + math.abs(l.Z) * s.Z) / 2
+	return cf.Position.X, cf.Position.Z, hx, hz
+end
+
+function Z.scanFX()
+	local now = os.clock()
+	if now - Z.lastFx < CONFIG.FxScanInterval then return end
+	Z.lastFx = now
+	local fx = workspace:FindFirstChild("FX")
+	if not fx then return end
+	for _, d in ipairs(fx:GetDescendants()) do
+		if d:IsA("BasePart") and not Z.seen[d] then
+			local nl = d.Name:lower()
+
+local pillar = false
+			local cur = d
+			while cur and cur ~= fx do
+				if matchAny(cur.Name:lower(), CONFIG.PillarKeywords) then pillar = true break end
+				cur = cur.Parent
+			end
+
+if pillar then
+				Z.seen[d] = now
+				Z.info[d] = { pad = CONFIG.PillarPadding }
+				dangerParts[d] = now + CONFIG.DangerTTL
+				lastTrigger = "trụ băng"
+			elseif not CONFIG.IgnoreFxNames[nl] and not isPlayerPart(d) then
+				local rad = Z.flatRadius(d)
+				if rad then
+					local c = d.Color
+					local red = isRed(c)
+					local dark = (c.R + c.G + c.B) / 3 < 0.12
+					local kw = matchAny(nl, CONFIG.DangerKeywords)
+					local named = kw or matchAny(nl, CONFIG.CircleNames)
+					if (named and (red or dark or kw)) or (red and rad >= 8) then
+						Z.seen[d] = now
+						Z.info[d] = { minR = red and CONFIG.RedCircleRadius or CONFIG.IndicatorRadius }
+						dangerParts[d] = now + CONFIG.DangerTTL
+						lastTrigger = (red and "vòng đỏ " or "vòng cảnh báo ") .. d.Name
+						dbg("FX circle:", d:GetFullName())
+					end
+				end
+			end
+		end
+	end
+end
+
+function Z.build()
+	local now = os.clock()
+	local zs = {}
+	local pad = math.max(CONFIG.DangerPadding, CONFIG.TelegraphPadding)
+
+for part, exp in pairs(dangerParts) do
+		if part.Parent and exp > now then
+			local info = Z.info[part]
+			local p = part.Position
+			local rad
+			if part:IsA("Part") and part.Shape == Enum.PartType.Ball then
+				rad = part.Size.X / 2
+			else
+				rad = Z.flatRadius(part)
+			end
+			if rad then
+				if info and info.minR then rad = math.max(rad, info.minR) end
+				zs[#zs + 1] = { x = p.X, z = p.Z, r = rad + pad, n = part.Name }
+			else
+				local x, z, hx, hz = Z.footprint(part)
+				local pd = (info and info.pad) or pad
+				zs[#zs + 1] = { x = x, z = z, hx = hx + pd, hz = hz + pd, n = part.Name }
+			end
+		end
+	end
+
+for obj, info in pairs(dangerCircles) do
+		if obj.Parent and info.exp > now then
+			zs[#zs + 1] = { x = obj.Position.X, z = obj.Position.Z, r = info.r + CONFIG.TelegraphPadding, n = "cột đỏ" }
+		end
+	end
+
+for obj, exp in pairs(laserParts) do
+		if obj.Parent and exp > now then
+			local a, b, hw = laserSegment(obj)
+			if a then
+				zs[#zs + 1] = { seg = true, ax = a.X, az = a.Z, bx = b.X, bz = b.Z, r = hw + CONFIG.LaserPadding, n = "tia laser" }
+			end
+		end
+	end
+
+if virtualAim then
+		zs[#zs + 1] = { seg = true, ax = virtualAim.a.X, az = virtualAim.a.Z, bx = virtualAim.b.X, bz = virtualAim.b.Z,
+			r = CONFIG.LaserPadding + 2, n = "laser (animation)" }
+	end
+	return zs
+end
+
+function Z.hit(zs, x, z)
+	for i = 1, #zs do
+		local q = zs[i]
+		if q.seg then
+			local abx, abz = q.bx - q.ax, q.bz - q.az
+			local l2 = abx * abx + abz * abz
+			local t = 0
+			if l2 > 1e-4 then t = math.clamp(((x - q.ax) * abx + (z - q.az) * abz) / l2, 0, 1) end
+			local dx, dz = x - (q.ax + abx * t), z - (q.az + abz * t)
+			if dx * dx + dz * dz <= q.r * q.r then return q end
+		elseif q.r then
+			local dx, dz = x - q.x, z - q.z
+			if dx * dx + dz * dz <= q.r * q.r then return q end
+		else
+			if math.abs(x - q.x) <= q.hx and math.abs(z - q.z) <= q.hz then return q end
+		end
+	end
+	return nil
+end
+
+local function effectiveRadius()
+	local rad = CONFIG.MobAttackRadius
+	if keepOn then rad = math.min(rad, keepDistance - CONFIG.DistanceTolerance - 1) end
+	return rad
+end
+
+local function inDanger(pos, zs, quiet)
+	zs = zs or Z.build()
+	local q = Z.hit(zs, pos.X, pos.Z)
+	if q then
+		if not quiet then lastTrigger = q.n end
+		return true
+	end
+	if #zs == 0 and os.clock() < attackUntil and currentTarget and currentTarget.Parent then
+		if flat(pos - currentTarget.Position).Magnitude < effectiveRadius() then
+			if not quiet then lastTrigger = "animation " .. lastAnim end
+			return true
+		end
+	end
+	return false
+end
+
+local function animName(tr)
+	local n = tr.Animation and tr.Animation.Name or ""
+	if n == "" or n == "Animation" then n = tr.Name or "" end
+	return n:lower()
+end
+
+local function animKey(tr)
+	local id = tr.Animation and tr.Animation.AnimationId or ""
+	if id ~= "" then return id end
+	return animName(tr)
+end
+
+local function isAttackAnim(tr)
+	if tr.Looped then return false end
+	local nm = animName(tr)
+	if learnedAnims[animKey(tr)] then return true end
+	if matchAny(nm, CONFIG.AttackAnimKeywords) then return true end
+	if matchAny(nm, CONFIG.IgnoreAnimKeywords) then return false end
+	local okp, pr = pcall(function() return tostring(tr.Priority) end)
+	if okp and pr:find("Action") then return true end
+	return false
+end
+
+local seenTracks = setmetatable({}, { __mode = "k" })
+local function scanMobAttack()
+	if not currentMob then return end
+	local animator = currentMob:FindFirstChildWhichIsA("Animator", true)
+	if not animator then return end
+	for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+		local last = seenTracks[tr]
+		local isNew = (last == nil) or (tr.TimePosition < last - 0.05)
+		seenTracks[tr] = tr.TimePosition
+		if tr.IsPlaying and matchAny(animName(tr), CONFIG.LaserAnimKeywords) then
+			laserUntil = os.clock() + 0.6
+		end
+		if isNew and isAttackAnim(tr) then
+			local now = os.clock()
+			attackUntil = now + math.clamp(tr.Length - tr.TimePosition, 1, 4)
+			lastAnim = animName(tr)
+			for _, c in ipairs(recentCandidates) do
+				if c.part.Parent and now - c.t <= 1.0 then
+					dangerParts[c.part] = now + CONFIG.DangerTTL
+					lastTrigger = "part lạ " .. c.part.Name
+				end
+			end
+			recentCandidates = {}
+			dbg("Mob attack anim:", lastAnim)
+		end
+	end
+end
+
+local function learnFromHit()
+	local _, hrp = getChar()
+	if not hrp then return end
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = { player.Character }
+	op.RespectCanCollide = false
+	local okp, parts = pcall(function() return workspace:GetPartBoundsInRadius(hrp.Position, 6, op) end)
+	if okp then
+		for _, p in ipairs(parts) do
+			if p ~= workspace.Terrain and not p.CanCollide and not GENERIC[p.Name]
+				and not CONFIG.IgnoreFxNames[p.Name:lower()] and not p.Name:match("^Part%d*\$")
+				and not insideRig(p) and not isPlayerPart(p) and biggest(p) >= 3 then
+				if not learnedNames[p.Name] then print("[LotScript] Học hitbox:", p:GetFullName()) end
+				learnedNames[p.Name] = true
+				dangerParts[p] = os.clock() + CONFIG.DangerTTL
+				lastTrigger = "đã học part " .. p.Name
+			end
+		end
+	end
+	if currentMob then
+		local animator = currentMob:FindFirstChildWhichIsA("Animator", true)
+		if animator then
+			for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+				local nm = animName(tr)
+				if tr.IsPlaying and not tr.Looped and not matchAny(nm, CONFIG.IgnoreAnimKeywords) then
+					local key = animKey(tr)
+					if not learnedAnims[key] then print("[LotScript] Học animation chiêu:", nm, key) end
+					learnedAnims[key] = true
+				end
+			end
+		end
+	end
+end
+
+local lastHealth = nil
+local function hookHealth(char)
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then return end
+	lastHealth = hum.Health
+	track(hum.HealthChanged:Connect(function(h)
+		if lastHealth and h < lastHealth - 0.5 and dodgeOn then
+			task.spawn(learnFromHit)
+		end
+		lastHealth = h
+	end))
+end
+if player.Character then task.spawn(hookHealth, player.Character) end
+track(player.CharacterAdded:Connect(function(c) task.spawn(hookHealth, c) end))
+
+----------------------------------------------------------------
+-- QUÉT MAP (v6: 2 chế độ — chính xác trước, 0 ô thì tự quét lại loose)
+----------------------------------------------------------------
+local grid = nil
+local scanning = false
+local lastScanAt = 0
+local mapNote = ""
+
+local function scanMap()
+	if scanning then return end
+	local _, hrp = getChar()
+	if not hrp then return end
+	scanning = true
+	lastScanAt = os.clock()
+	mapNote = "Đang quét map..."
+
+local center = hrp.Position
+	if currentTarget and currentTarget.Parent then
+		center = (hrp.Position + currentTarget.Position) / 2
+	end
+	local R, cs = CONFIG.ScanRadius, CONFIG.CellSize
+	local N = math.floor(2 * R / cs) + 1
+	local ox, oz = center.X - R, center.Z - R
+	local g = { N = N, cs = cs, ox = ox, oz = oz, y = {}, walk = {}, edge = {}, good = {}, cx = center.X, cz = center.Z, R = R }
+	local hip = hipOffset()
+	local refY = hrp.Position.Y
+
+local rp, op = rayParams(), overlapParams()
+
+-- [FIX no-map] chế độ loose: trúng CẢ part không va chạm (sàn mesh) + bỏ check vật cản vô hình
+	local rp2 = RaycastParams.new()
+	rp2.FilterType = Enum.RaycastFilterType.Exclude
+	rp2.FilterDescendantsInstances = excludeList()
+	rp2.RespectCanCollide = false
+	rp2.IgnoreWater = true
+
+local function scanCells(loose)
+		g.walk, g.y = {}, {}
+		local hitCount = 0
+		for ix = 0, N - 1 do
+			for iz = 0, N - 1 do
+				local wx = ox + (ix + 0.5) * cs
+				local wz = oz + (iz + 0.5) * cs
+				-- [FIX] tia dài 90 studs thay vì 60
+				local hit = workspace:Raycast(Vector3.new(wx, refY + 12, wz), Vector3.new(0, -90, 0), loose and rp2 or rp)
+				if hit and hit.Normal.Y > (loose and 0.3 or 0.65) then
+					hitCount += 1
+					local gy = hit.Position.Y
+					local free = true
+					if not loose then
+						local parts = workspace:GetPartBoundsInBox(CFrame.new(wx, gy + 3.5, wz), Vector3.new(cs * 0.8, 4, cs * 0.8), op)
+						free = #parts == 0
+					end
+					if free then
+						g.walk[ix * N + iz] = true
+						g.y[ix * N + iz] = gy + hip
+					end
+				end
+				if (ix * N + iz) % 200 == 0 then task.wait() end
+			end
+			mapNote = string.format("Đang quét map... %d%%", math.floor(ix / N * 100))
+		end
+		return hitCount
+	end
+
+-- [FIX no-map] quét chính xác trước; 0 ô thì tự quét lại loose + báo rõ lý do
+	local hitCount = scanCells(false)
+	if hitCount == 0 then
+		mapNote = "Tia không trúng sàn (sàn mesh?) — đang quét lại loose..."
+		scanCells(true)
+	else
+		local walk0 = 0
+		for _ in pairs(g.walk) do walk0 += 1 end
+		if walk0 == 0 then
+			mapNote = "Sàn bị part vô hình phủ — đang quét lại loose..."
+			scanCells(true)
+		end
+	end
+
+local dirs4 = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
+	local queue, head = {}, 1
+	for key in pairs(g.walk) do
+		local ix, iz = key // N, key % N
+		local seed = false
+		for _, d in ipairs(dirs4) do
+			local jx, jz = ix + d[1], iz + d[2]
+			if jx < 0 or jz < 0 or jx >= N or jz >= N then
+				seed = true
+			else
+				local nk = jx * N + jz
+				if not g.walk[nk] or math.abs(g.y[key] - g.y[nk]) > CONFIG.MaxStep then seed = true end
+			end
+			if seed then break end
+		end
+		if seed then
+			g.edge[key] = 1
+			queue[#queue + 1] = key
+		end
+	end
+	while head <= #queue do
+		local key = queue[head]
+		head += 1
+		local ix, iz = key // N, key % N
+		local e = g.edge[key]
+		for _, d in ipairs(dirs4) do
+			local jx, jz = ix + d[1], iz + d[2]
+			if jx >= 0 and jz >= 0 and jx < N and jz < N then
+				local nk = jx * N + jz
+				if g.walk[nk] and not g.edge[nk] then
+					g.edge[nk] = e + 1
+					queue[#queue + 1] = nk
+				end
+			end
+		end
+	end
+
+local function computeGood(th)
+		local compOf, bestMembers, bestSize, id = {}, nil, 0, 0
+		for key in pairs(g.walk) do
+			if (g.edge[key] or 9) >= th and not compOf[key] then
+				id += 1
+				local stack, members = { key }, {}
+				compOf[key] = id
+				while #stack > 0 do
+					local cur = table.remove(stack)
+					members[#members + 1] = cur
+					local ix, iz = cur // N, cur % N
+					for dx = -1, 1 do
+						for dz = -1, 1 do
+							if dx ~= 0 or dz ~= 0 then
+								local jx, jz = ix + dx, iz + dz
+								if jx >= 0 and jz >= 0 and jx < N and jz < N then
+									local nk = jx * N + jz
+									if g.walk[nk] and not compOf[nk] and (g.edge[nk] or 9) >= th
+										and math.abs(g.y[cur] - g.y[nk]) <= CONFIG.MaxStep then
+										compOf[nk] = id
+										stack[#stack + 1] = nk
+									end
+								end
+							end
+						end
+					end
+				end
+				if #members > bestSize then bestMembers, bestSize = members, #members end
+			end
+		end
+		return bestMembers, bestSize
+	end
+
+local walkCount = 0
+	for _ in pairs(g.walk) do walkCount += 1 end
+	if walkCount == 0 then
+		mapNote = "Quét map thất bại cả 2 chế độ — Keep Distance vẫn đi thẳng không cần map"
+		scanning = false
+		return
+	end
+	local members, size = computeGood(2)
+	if not members or size < walkCount * 0.15 then members, size = computeGood(1) end
+	if members then
+		for _, key in ipairs(members) do g.good[key] = true end
+	end
+	g.walkCount, g.goodCount = walkCount, members and #members or 0
+	grid = g
+	mapNote = string.format("Map: %d ô đi được, %d ô an toàn", walkCount, g.goodCount)
+	scanning = false
+end
+
+requestScan = function(force)
+	if scanning then return end
+	if not force and grid and os.clock() - lastScanAt < 8 then return end
+	task.spawn(function()
+		local ok, err = pcall(scanMap)
+		if not ok then
+			scanning = false
+			mapNote = "Lỗi quét map: " .. tostring(err)
+		end
+	end)
+end
+
+local function cellKeyOf(pos)
+	if not grid then return nil end
+	local ix = math.floor((pos.X - grid.ox) / grid.cs)
+	local iz = math.floor((pos.Z - grid.oz) / grid.cs)
+	if ix < 0 or iz < 0 or ix >= grid.N or iz >= grid.N then return nil end
+	return ix * grid.N + iz, ix, iz
+end
+
+local function cellPos(key)
+	local N = grid.N
+	local ix, iz = key // N, key % N
+	return Vector3.new(grid.ox + (ix + 0.5) * grid.cs, grid.y[key], grid.oz + (iz + 0.5) * grid.cs)
+end
+
+local function nearestWalk(ix, iz)
+	local g = grid
+	local N = g.N
+	if ix >= 0 and iz >= 0 and ix < N and iz < N and g.walk[ix * N + iz] then return ix * N + iz end
+	for r = 1, 5 do
+		local best, bd
+		for dx = -r, r do
+			for dz = -r, r do
+				if math.max(math.abs(dx), math.abs(dz)) == r then
+					local jx, jz = ix + dx, iz + dz
+					if jx >= 0 and jz >= 0 and jx < N and jz < N then
+						local nk = jx * N + jz
+						if g.walk[nk] then
+							local d = dx * dx + dz * dz
+							if not bd or d < bd then best, bd = nk, d end
+						end
+					end
+				end
+			end
+		end
+		if best then return best end
+	end
+	return nil
+end
+
+----------------------------------------------------------------
+-- A* trên lưới
+----------------------------------------------------------------
+local function heapPush(h, key, pri)
+	local n = h.n + 1
+	h.n = n
+	h.k[n], h.p[n] = key, pri
+	local i = n
+	while i > 1 do
+		local par = i // 2
+		if h.p[par] <= h.p[i] then break end
+		h.k[par], h.k[i] = h.k[i], h.k[par]
+		h.p[par], h.p[i] = h.p[i], h.p[par]
+		i = par
+	end
+end
+
+local function heapPop(h)
+	local n = h.n
+	if n == 0 then return nil end
+	local key = h.k[1]
+	h.k[1], h.p[1] = h.k[n], h.p[n]
+	h.k[n], h.p[n] = nil, nil
+	n -= 1
+	h.n = n
+	local i = 1
+	while true do
+		local l, r, s = i * 2, i * 2 + 1, i
+		if l <= n and h.p[l] < h.p[s] then s = l end
+		if r <= n and h.p[r] < h.p[s] then s = r end
+		if s == i then break end
+		h.k[s], h.k[i] = h.k[i], h.k[s]
+		h.p[s], h.p[i] = h.p[i], h.p[s]
+		i = s
+	end
+	return key
+end
+
+local tempBlocked = {}
+
+local function astar(startKey, isGoal, hfun, maxExp, penalty)
+	local g = grid
+	local N = g.N
+	local now = os.clock()
+	local open = { n = 0, k = {}, p = {} }
+	local gs, came, closed = { [startKey] = 0 }, {}, {}
+	heapPush(open, startKey, hfun(startKey))
+	local exp = 0
+	while true do
+		local key = heapPop(open)
+		if not key then return nil end
+		if not closed[key] then
+			closed[key] = true
+			if isGoal(key) then
+				local path = { key }
+				while came[key] do
+					key = came[key]
+					table.insert(path, 1, key)
+				end
+				return path
+			end
+			exp += 1
+			if exp > maxExp then return nil end
+			local ix, iz = key // N, key % N
+			for dx = -1, 1 do
+				for dz = -1, 1 do
+					if dx ~= 0 or dz ~= 0 then
+						local jx, jz = ix + dx, iz + dz
+						if jx >= 0 and jz >= 0 and jx < N and jz < N then
+							local nk = jx * N + jz
+							if g.walk[nk] and not closed[nk] and not (tempBlocked[nk] and tempBlocked[nk] > now)
+								and math.abs(g.y[key] - g.y[nk]) <= CONFIG.MaxStep then
+								local ok = true
+								if dx ~= 0 and dz ~= 0 then
+									ok = g.walk[(ix + dx) * N + iz] and g.walk[ix * N + (iz + dz)]
+								end
+								if ok then
+									local step = (dx ~= 0 and dz ~= 0) and 1.414 or 1
+									local ng = gs[key] + step * g.cs * (1 + penalty(nk))
+									if not gs[nk] or ng < gs[nk] then
+										gs[nk] = ng
+										came[nk] = key
+										heapPush(open, nk, ng + hfun(nk))
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function lineClear(a, b, zs)
+	local g = grid
+	local N = g.N
+	local d = flat(b - a)
+	local len = d.Magnitude
+	if len < 0.1 then return true end
+	local steps = math.ceil(len / (g.cs * 0.5))
+	local lastY = a.Y
+	local now = os.clock()
+	for i = 1, steps do
+		local p = a + d * (i / steps)
+		local ix = math.floor((p.X - g.ox) / g.cs)
+		local iz = math.floor((p.Z - g.oz) / g.cs)
+		if ix < 0 or iz < 0 or ix >= N or iz >= N then return false end
+		local key = ix * N + iz
+		if not g.walk[key] or (tempBlocked[key] and tempBlocked[key] > now) then return false end
+		if math.abs(g.y[key] - lastY) > CONFIG.MaxStep then return false end
+		if zs and #zs > 0 and Z.hit(zs, p.X, p.Z) then return false end
+		lastY = g.y[key]
+	end
+	return true
+end
+
+local function planGrid(hrp, rootPos, mode, zs)
+	local g = grid
+	local N = g.N
+	local _, ix, iz = cellKeyOf(hrp.Position)
+	if not ix then return nil end
+	local startKey = nearestWalk(ix, iz)
+	if not startKey then return nil end
+	local bx, bz = rootPos.X, rootPos.Z
+	local keep, tol = keepDistance, CONFIG.DistanceTolerance
+	local dangerActive = #zs > 0
+
+local function bdist(key)
+		local jx, jz = key // N, key % N
+		local x = g.ox + (jx + 0.5) * g.cs
+		local z = g.oz + (jz + 0.5) * g.cs
+		return math.sqrt((x - bx) ^ 2 + (z - bz) ^ 2), x, z
+	end
+
+local function safeCell(key)
+		if not dangerActive then return true end
+		local _, x, z = bdist(key)
+		return not Z.hit(zs, x, z)
+	end
+
+local function penalty(nk)
+		local p = 0
+		local e = g.edge[nk] or 9
+		if e <= 1 then p += 1.5 elseif e == 2 then p += 0.4 end
+		if not g.good[nk] then p += 2 end
+		local d, x, z = bdist(nk)
+		if d < 12 then p += 4 end
+		if dangerActive and Z.hit(zs, x, z) then p += 30 end
+		return p
+	end
+
+for pass = 1, 2 do
+		local needGood = (pass == 1)
+		local isGoal, hf
+		if mode == "approach" then
+			isGoal = function(key) return bdist(key) <= keep and (not needGood or g.good[key]) and safeCell(key) end
+			hf = function(key) return math.max(0, bdist(key) - keep) end
+		elseif mode == "retreat" then
+			isGoal = function(key) return bdist(key) >= keep and (not needGood or g.good[key]) and safeCell(key) end
+			hf = function(key) return math.max(0, keep - bdist(key)) end
+		else
+			isGoal = function(key)
+				return g.good[key] and math.abs(bdist(key) - keep) <= tol + g.cs and safeCell(key)
+			end
+			hf = function() return 0 end
+		end
+		local path = astar(startKey, isGoal, hf, 3500, penalty)
+		if path then
+			local pts = {}
+			for _, key in ipairs(path) do table.insert(pts, cellPos(key)) end
+			return pts
+		end
+	end
+	return nil
+end
+
+----------------------------------------------------------------
+-- AUTO DODGE: chỉ tele ra khỏi vùng chiêu (ưu tiên số 1)
+----------------------------------------------------------------
+local function findSafePoint(hrp, maxR, zs)
+	local mobPos = currentTarget and currentTarget.Parent and currentTarget.Position or nil
+	local limit = keepDistance + CONFIG.DistanceTolerance
+	local best, bestScore
+
+if grid then
+		local sk, sx, sz = cellKeyOf(hrp.Position)
+		if sx then
+			local g = grid
+			local rc = math.ceil(maxR / g.cs)
+			for dx = -rc, rc do
+				for dz = -rc, rc do
+					local jx, jz = sx + dx, sz + dz
+					if jx >= 0 and jz >= 0 and jx < g.N and jz < g.N then
+						local key = jx * g.N + jz
+						if g.walk[key] then
+							local p = cellPos(key)
+							local dist = flat(p - hrp.Position).Magnitude
+							if dist <= maxR and dist >= 3 and not inDanger(p, zs, true) then
+								local score = dist * 0.5
+								if not g.good[key] then score += 25 end
+								if mobPos then
+									local d = flat(p - mobPos).Magnitude
+									if d > limit then score += (d - limit) * 2 end
+									score += math.abs(d - keepDistance) * 0.3
+								end
+								if not bestScore or score < bestScore then best, bestScore = p, score end
+							end
+						end
+					end
+				end
+			end
+			if best then return best end
+		end
+	end
+
+for _, frac in ipairs({ 0.4, 0.7, 1.0 }) do
+		local r = maxR * frac
+		for a = 0, 330, 30 do
+			local ang = math.rad(a)
+			local p = hrp.Position + Vector3.new(math.cos(ang), 0, math.sin(ang)) * r
+			local gp = groundAt(p, hrp.Position.Y)
+			if gp and not inDanger(gp, zs, true) and spaceFree(gp) then
+				local score = r * 0.5
+				if mobPos then
+					local d = flat(gp - mobPos).Magnitude
+					if d > limit then score += (d - limit) * 2 end
+					score += math.abs(d - keepDistance) * 0.3
+				end
+				if not bestScore or score < bestScore then best, bestScore = gp, score end
+			end
+		end
+	end
+	return best
+end
+
+local lastTele = 0
+local teleLog = {}
+local dodgePausedUntil = 0
+
+local function doDodge(zs)
+	local _, hrp = getChar()
+	if not hrp then return end
+	local now = os.clock()
+	if now < dodgePausedUntil then return end
+	if now - lastTele < CONFIG.TeleCooldown then return end
+
+for i = #teleLog, 1, -1 do
+		if now - teleLog[i] > 3 then table.remove(teleLog, i) end
+	end
+	if #teleLog >= 6 then
+		dodgePausedUntil = now + 1
+		teleLog = {}
+		dodgeStatus.Text = "Dodge: tele liên tục (" .. lastTrigger .. ") nên nghỉ 1s. Kiểm tra MobAttackRadius / keyword."
+		return
+	end
+
+lastTele = now
+	local base = math.max(teleDistance, 6)
+	local p
+	for _, mult in ipairs({ 1, 1.6, 2.5, 100 }) do
+		local rr = math.min(base * mult, CONFIG.TeleMax)
+		p = findSafePoint(hrp, rr, zs)
+		if p then break end
+	end
+	if p then
+		table.insert(teleLog, now)
+		hrp.CFrame = CFrame.new(p + Vector3.new(0, 0.3, 0)) * (hrp.CFrame - hrp.CFrame.Position)
+		dodgeStatus.Text = "Dodge: đã tele (" .. lastTrigger .. ")"
+		if resetPath then resetPath() end
+	else
+		dodgeStatus.Text = "Dodge: không tìm được chỗ an toàn (đã thử tới " .. CONFIG.TeleMax .. " studs)"
+	end
+end
+
+local function laserSidestepDue()
+	local now = os.clock()
+	if now >= laserUntil then return false end
+	for obj, exp in pairs(laserParts) do
+		if obj.Parent and exp > now then return false end
+	end
+	return now - lastTele >= CONFIG.LaserSidestepEvery
+end
+
+task.spawn(function()
+	while gui.Parent do
+		if dodgeOn then
+			if not beamsScanned then
+				beamsScanned = true
+				for _, d in ipairs(workspace:GetDescendants()) do
+					if d:IsA("Beam") then beamList[d] = true end
+				end
+			end
+			if not grid and not scanning and os.clock() - lastScanAt > 8 then
+				requestScan(false)
+			end
+			scanMobAttack()
+			scanBeams()
+			Z.scanFX()
+			local now = os.clock()
+			for part, exp in pairs(dangerParts) do
+				if (not part.Parent) or exp <= now then dangerParts[part] = nil end
+			end
+			for obj, info in pairs(dangerCircles) do
+				if (not obj.Parent) or info.exp <= now then dangerCircles[obj] = nil end
+			end
+			for obj, exp in pairs(laserParts) do
+				if (not obj.Parent) or exp <= now then laserParts[obj] = nil end
+			end
+
+local zs = Z.build()
+			local _, hrp = getChar()
+			local need = hrp and inDanger(hrp.Position, zs)
+			if hrp and not need and currentTarget and currentTarget.Parent and laserSidestepDue() then
+				local a = currentTarget.Position
+				local dir = flat(hrp.Position - a)
+				if dir.Magnitude > 0.1 then
+					virtualAim = { a = a, b = a + dir.Unit * 150 }
+					lastTrigger = "laser (animation)"
+					need = true
+					zs = Z.build()
+				end
+			end
+			if need then
+				Z.hold = os.clock() + CONFIG.SkillHoldAfterDodge
+				local ok, err = pcall(doDodge, zs)
+				if not ok then dbg("Dodge error:", err) end
+				virtualAim = nil
+				Z.hold = os.clock() + CONFIG.SkillHoldAfterDodge
+			elseif os.clock() - lastTele > 1.5 and os.clock() - dodgePausedUntil > 0 and not logging then
+				dodgeStatus.Text = "Dodge: đang theo dõi (" .. #zs .. " vùng)" .. (lastTrigger ~= "" and (" - gần nhất: " .. lastTrigger) or "")
+			end
+			task.wait(0.05)
+		else
+			if not logging then dodgeStatus.Text = "Dodge: tắt" end
+			task.wait(0.3)
+		end
+	end
+end)
+
+----------------------------------------------------------------
+-- GHI LOG CHIÊU
+----------------------------------------------------------------
+startActionLog = function()
+	if logging then return end
+	logging = true
+	local lines = {}
+	local t0 = os.clock()
+
+local function add(s)
+		if #lines < 300 then
+			table.insert(lines, string.format("[%.1fs] %s", os.clock() - t0, s))
+		end
+	end
+	local function rgb(c)
+		return math.floor(c.R * 255) .. "," .. math.floor(c.G * 255) .. "," .. math.floor(c.B * 255)
+	end
+	local function f1(x) return string.format("%.1f", x) end
+
+add("Target: " .. (currentMob and currentMob:GetFullName() or "không có"))
+	do
+		local k = 0
+		for _, d in ipairs(workspace:GetDescendants()) do
+			if d:IsA("Humanoid") and k < 20 then
+				k += 1
+				local m = d.Parent
+				add(string.format("HUM %s | maxhp %s | hp %s | %s", tostring(m and m.Name), tostring(d.MaxHealth),
+					tostring(math.floor(d.Health)), m and m:GetFullName() or "?"))
+			end
+		end
+	end
+	dodgeStatus.Text = "Đang ghi log " .. CONFIG.LogSeconds .. "s: hãy để boss tung chiêu..."
+
+local c1 = workspace.DescendantAdded:Connect(function(i)
+		task.defer(function()
+			if not logging then return end
+			if i:IsA("BasePart") then
+				if isPlayerPart(i) or i == workspace.Terrain then return end
+				add(string.format("PART %s | size %s,%s,%s | rgb %s | collide=%s tr=%.2f %s | %s",
+					i.Name, f1(i.Size.X), f1(i.Size.Y), f1(i.Size.Z), rgb(i.Color),
+					tostring(i.CanCollide), i.Transparency, tostring(i.Material), i:GetFullName()))
+			elseif i:IsA("Decal") or i:IsA("Texture") then
+				add(string.format("DECAL %s | rgb %s | %s", i.Name, rgb(i.Color3), i:GetFullName()))
+			elseif i:IsA("Beam") then
+				add(string.format("BEAM %s | width %s,%s | %s", i.Name, f1(i.Width0), f1(i.Width1), i:GetFullName()))
+			elseif i:IsA("SurfaceGui") or i:IsA("BillboardGui") then
+				add(string.format("GUI3D %s %s | %s", i.ClassName, i.Name, i:GetFullName()))
+			elseif i:IsA("ImageLabel") and i:FindFirstAncestorOfClass("SurfaceGui") then
+				add(string.format("IMAGE %s | rgb %s | %s", i.Name, rgb(i.ImageColor3), i:GetFullName()))
+			end
+		end)
+	end)
+
+local _, _, hum = getChar()
+	local hc
+	if hum then
+		local last = hum.Health
+		hc = hum.HealthChanged:Connect(function(h)
+			if h < last - 0.5 then
+				add("HP -" .. math.floor(last - h) .. " (còn " .. math.floor(h) .. ")")
+			end
+			last = h
+		end)
+	end
+
+task.spawn(function()
+		local seen = setmetatable({}, { __mode = "k" })
+		while logging and os.clock() - t0 < CONFIG.LogSeconds do
+			if currentMob then
+				local an = currentMob:FindFirstChildWhichIsA("Animator", true)
+				if an then
+					for _, tr in ipairs(an:GetPlayingAnimationTracks()) do
+						if not seen[tr] then
+							seen[tr] = true
+							add(string.format("ANIM %s | id %s | len %s | looped=%s | prio %s",
+								animName(tr), tostring(tr.Animation and tr.Animation.AnimationId),
+								f1(tr.Length), tostring(tr.Looped), tostring(tr.Priority)))
+						end
+					end
+				end
+			end
+			task.wait(0.15)
+		end
+	end)
+
+task.delay(CONFIG.LogSeconds, function()
+		logging = false
+		c1:Disconnect()
+		if hc then hc:Disconnect() end
+		local text = table.concat(lines, "\n")
+		print("[LotScript LOG]\n" .. text)
+		local copied = false
+		pcall(function()
+			if setclipboard then
+				setclipboard(text)
+				copied = true
+			end
+		end)
+		dodgeStatus.Text = "Log xong: " .. #lines .. " dòng" .. (copied and " (đã copy vào clipboard, dán gửi tôi)" or " (xem console F9)")
+	end)
+end
+
+----------------------------------------------------------------
+-- KEEP DISTANCE (di chuyển 100%, không tele)
+----------------------------------------------------------------
+do
+local pathObj = PathfindingService:CreatePath({
+	AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4,
+})
+
+local pathPts = nil
+local lastPlan = 0
+local lastPos, lastPosTime = nil, 0
+local moveMode = nil
+local stuckCount = 0
+local settleBlockUntil = 0
+local cframeMode = (CONFIG.MoveMethod == "cframe")
+
+resetPath = function()
+	pathPts = nil
+	lastPlan = 0
+	lastPos = nil
+	moveMode = nil
+	stuckCount = 0
+	desiredPoint = nil
+	cframeMode = (CONFIG.MoveMethod == "cframe")
+end
+
+local function moveStep(dt)
+	if not (keepOn and desiredPoint) then return end
+	local _, hrp, hum = getChar()
+	if not (hrp and hum and hum.Health > 0) then return end
+	local dir = flat(desiredPoint - hrp.Position)
+	if dir.Magnitude < 0.6 then return end
+	dir = dir.Unit
+	if cframeMode then
+		local step = math.max(hum.WalkSpeed, 8) * dt
+		local newPos = hrp.Position + dir * step
+		local face = targetOn and flat(hrp.CFrame.LookVector) or dir
+		if face.Magnitude < 0.01 then face = dir end
+		hrp.CFrame = CFrame.lookAt(newPos, newPos + face)
+	else
+		hum:Move(dir, false)
+	end
+end
+-- [FIX] dùng tên hook riêng của lần chạy này
+RunService:BindToRenderStep(MOVE_NAME, Enum.RenderPriority.Last.Value, moveStep)
+
+local function planFallback(hrp, rootPos, dir)
+	local goal = rootPos + dir * keepDistance
+	goal = Vector3.new(goal.X, hrp.Position.Y, goal.Z)
+	local ok = pcall(function() pathObj:ComputeAsync(hrp.Position, goal) end)
+	if ok and pathObj.Status == Enum.PathStatus.Success then
+		local pts = {}
+		for _, wp in ipairs(pathObj:GetWaypoints()) do table.insert(pts, wp.Position) end
+		return pts
+	end
+	return { goal }
+end
+
+task.spawn(function()
+	while gui.Parent do
+		task.wait(0.1)
+		if not keepOn then
+			desiredPoint = nil
+			keepStatus.Text = "Giữ khoảng cách: tắt"
+			continue
+		end
+
+local _, hrp, hum = getChar()
+		if not (hrp and hum and hum.Health > 0) then
+			desiredPoint = nil
+			continue
+		end
+
+-- [FIX] chưa có lưới map: quét; nếu quét xong mà vẫn không có lưới thì đi thẳng (không cần map)
+		if not grid then
+			if not scanning and os.clock() - lastScanAt > 10 then requestScan(true) end
+			if scanning or lastScanAt == 0 then
+				desiredPoint = nil
+				keepStatus.Text = "Giữ khoảng cách: " .. (mapNote ~= "" and mapNote or "đang quét map...")
+				continue
+			end
+		else
+			local dxg = math.sqrt((hrp.Position.X - grid.cx) ^ 2 + (hrp.Position.Z - grid.cz) ^ 2)
+			if dxg > grid.R - 14 and not scanning and os.clock() - lastScanAt > 8 then
+				requestScan(true)
+			end
+		end
+
+if not (currentTarget and currentTarget.Parent) then
+			desiredPoint = nil
+			keepStatus.Text = "Giữ khoảng cách: chưa thấy boss (kiểm tra CONFIG.BossName). " .. mapNote
+			continue
+		end
+
+local rootPos = currentTarget.Position
+		local rel = flat(hrp.Position - rootPos)
+		local d = rel.Magnitude
+		local dir = (d > 0.1) and rel.Unit or Vector3.new(1, 0, 0)
+		local tol = CONFIG.DistanceTolerance
+		local now = os.clock()
+
+-- đang né chiêu: dừng đi bộ, nhường cho tele
+		if dodgeOn and now < Z.hold then
+			desiredPoint = nil
+			continue
+		end
+
+local zs = dodgeOn and Z.build() or {}
+
+if moveMode == nil or moveMode == "settle" then
+			if d > keepDistance + tol then
+				moveMode = "approach"
+			elseif d < keepDistance - tol then
+				moveMode = "retreat"
+			end
+		elseif moveMode == "approach" then
+			if d <= keepDistance then moveMode = nil end
+		elseif moveMode == "retreat" then
+			if d >= keepDistance then moveMode = nil end
+		end
+
+local curKey = grid and cellKeyOf(hrp.Position) or nil
+		if moveMode == nil and grid and curKey and grid.walk[curKey] and not grid.good[curKey] and now > settleBlockUntil then
+			moveMode = "settle"
+		elseif moveMode == "settle" and (not grid or not curKey or grid.good[curKey]) then
+			moveMode = nil
+		end
+
+local label = (moveMode == "approach" and " (đang đi tới boss)")
+			or (moveMode == "retreat" and " (đang lùi ra)")
+			or (moveMode == "settle" and " (đang ra chỗ thoáng)") or " (đã đủ - dùng chiêu)"
+		keepStatus.Text = string.format("Khoảng cách: %d / %d%s%s%s", math.floor(d), keepDistance, label,
+			cframeMode and " [CFrame]" or "", grid and "" or " [map lỗi - vẫn đi thẳng]")
+
+if not moveMode then
+			desiredPoint = nil
+			pathPts = nil
+			lastPos = nil
+			stuckCount = 0
+			if CONFIG.MoveMethod == "auto" then cframeMode = false end
+			continue
+		end
+
+if not lastPos then
+			lastPos, lastPosTime = hrp.Position, now
+		elseif now - lastPosTime >= 1 then
+			if (hrp.Position - lastPos).Magnitude < 1.5 then
+				stuckCount += 1
+				hum.Jump = true
+				if desiredPoint and grid then
+					local fdir = flat(desiredPoint - hrp.Position)
+					if fdir.Magnitude > 0.1 then
+						local fk = cellKeyOf(hrp.Position + fdir.Unit * grid.cs * 1.2)
+						if fk then tempBlocked[fk] = now + 5 end
+					end
+				end
+				pathPts = nil
+				if stuckCount >= 2 and CONFIG.MoveMethod == "auto" then cframeMode = true end
+			else
+				stuckCount = 0
+			end
+			lastPos, lastPosTime = hrp.Position, now
+		end
+
+if (not pathPts) or now - lastPlan >= 0.5 then
+			lastPlan = now
+			local pts = nil
+			if grid then pts = planGrid(hrp, rootPos, moveMode, zs) end
+			if not pts then
+				if moveMode == "settle" then
+					moveMode = nil
+					settleBlockUntil = now + 3
+					desiredPoint = nil
+					continue
+				end
+				if #zs > 0 and grid then
+					-- đang có vùng chiêu chắn đường: đứng yên, đừng đi bộ vào vùng nguy hiểm
+					desiredPoint = nil
+					pathPts = nil
+					keepStatus.Text = keepStatus.Text .. " | chờ vùng chiêu tan"
+					continue
+				end
+				pts = planFallback(hrp, rootPos, dir)
+			end
+			pathPts = pts
+		end
+
+local target = nil
+		if pathPts then
+			local first = nil
+			for i, p in ipairs(pathPts) do
+				if flat(p - hrp.Position).Magnitude > 3 then first = i break end
+			end
+			if first then
+				target = pathPts[first]
+				if grid then
+					for j = math.min
